@@ -1,9 +1,7 @@
 locals {
   ecs = {
-    cluster_name                        = "webui-bedrock-cluster"
-    service_name_webui                  = "openwebui"
-    service_name_bedrock_access_gateway = "bedrock-access-gateway"
-    service_name_mcpo                   = "mcpo"
+    cluster_name       = "openwebui-prod-cluster"
+    service_name_webui = "openwebui"
   }
 }
 
@@ -13,7 +11,7 @@ resource "aws_iam_service_linked_role" "AWSServiceRoleForECS" {
 }
 
 resource "aws_ecs_cluster" "ecs_cluster" {
-  name = local.ecs.cluster_name
+  name       = local.ecs.cluster_name
   depends_on = [aws_iam_service_linked_role.AWSServiceRoleForECS]
 }
 
@@ -50,7 +48,7 @@ module "alb_sg" {
 }
 
 resource "aws_lb" "alb" {
-  name               = "webui-bedrock-alb"
+  name               = "openwebui-prod-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [module.alb_sg.id]
@@ -74,7 +72,7 @@ resource "aws_lb_listener" "alb_listener" {
 }
 
 resource "aws_lb_target_group" "alb_target_group" {
-  name        = "webui-bedrock-target-group"
+  name        = "openwebui-prod-tg"
   port        = 80
   protocol    = "HTTP"
   vpc_id      = aws_vpc.default.id
@@ -115,10 +113,7 @@ data "aws_iam_policy_document" "task_execution_policy" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
-      aws_secretsmanager_secret.bag_api_key_secret.arn,
-      aws_secretsmanager_secret.mcpo_api_key_secret.arn,
-      aws_secretsmanager_secret.gitlab_token_secret.arn,
-      aws_secretsmanager_secret.linear_token_secret.arn
+      aws_secretsmanager_secret.openrouter_api_key.arn
     ]
   }
 
@@ -148,23 +143,33 @@ module "task_execution_role" {
   ]
 }
 
-data "aws_iam_policy_document" "bag_service_policy" {
+# Task Role for OpenWebUI (S3 access)
+data "aws_iam_policy_document" "openwebui_task_policy" {
+  # S3 Permissions for file storage
   statement {
-    actions   = ["bedrock:*"]
-    resources = ["*"]
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket"
+    ]
+    resources = [
+      aws_s3_bucket.openwebui_storage.arn,
+      "${aws_s3_bucket.openwebui_storage.arn}/*"
+    ]
   }
 }
 
-resource "aws_iam_policy" "bag_service_policy" {
-  name_prefix = "bag-service-policy-"
-  policy      = data.aws_iam_policy_document.bag_service_policy.json
+resource "aws_iam_policy" "openwebui_task_policy" {
+  name_prefix = "openwebui-task-policy-"
+  policy      = data.aws_iam_policy_document.openwebui_task_policy.json
 }
 
-module "bag_service_role" {
+module "openwebui_task_role" {
   source              = "./modules/iam_role"
-  name                = "${local.ecs.cluster_name}-bag-service-role"
+  name                = "${local.ecs.cluster_name}-openwebui-task-role"
   service             = ["ecs-tasks.amazonaws.com"]
-  managed_policy_arns = [aws_iam_policy.bag_service_policy.arn]
+  managed_policy_arns = [aws_iam_policy.openwebui_task_policy.arn]
 }
 
 # OPENWEBUI
@@ -197,12 +202,12 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
   memory                   = 4096
   cpu                      = 2048
   execution_role_arn       = module.task_execution_role.arn
-  task_role_arn            = module.task_execution_role.arn
+  task_role_arn            = module.openwebui_task_role.arn
 
   container_definitions = jsonencode([
     {
       name      = "openwebui"
-      image     = "${aws_ecr_repository.openwebui_repository.repository_url}:latest"
+      image     = "ghcr.io/open-webui/open-webui:main"
       essential = true
       portMappings = [
         {
@@ -212,15 +217,43 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
         }
       ]
       environment = [
+        # S3 Storage Configuration
+        {
+          name  = "STORAGE_PROVIDER"
+          value = "s3"
+        },
+        {
+          name  = "S3_BUCKET_NAME"
+          value = aws_s3_bucket.openwebui_storage.id
+        },
+        {
+          name  = "S3_REGION_NAME"
+          value = var.region
+        },
+        {
+          name  = "S3_ENDPOINT_URL"
+          value = "https://s3.${var.region}.amazonaws.com"
+        },
+        # OpenRouter API Configuration
         {
           name  = "OPENAI_API_BASE_URL"
-          value = "http://gateway.bedrock.local/api/v1"
+          value = "https://openrouter.ai/api/v1"
+        },
+        # General Configuration
+        {
+          name  = "WEBUI_SECRET_KEY"
+          value = random_password.webui_secret_key.result
+        },
+        # Enable basic authentication
+        {
+          name  = "WEBUI_AUTH"
+          value = "true"
         }
       ]
       secrets = [
         {
           name      = "OPENAI_API_KEY"
-          valueFrom = aws_secretsmanager_secret.bag_api_key_secret.arn
+          valueFrom = aws_secretsmanager_secret.openrouter_api_key.arn
         }
       ]
       logConfiguration = {
@@ -323,207 +356,8 @@ resource "aws_efs_mount_target" "efs_mount" {
   security_groups = [module.efs_sg.id]
 }
 
-# MODULES FOR OPENWEBUI
-module "ecs_service_module_sg" {
-  source = "./modules/security_group"
-
-  name   = "module-sg"
-  vpc_id = aws_vpc.default.id
-
-  cidr_egresses = [{
-    cidr_blocks = ["0.0.0.0/0"]
-    port        = 0
-    protocol    = "-1"
-  }]
-
-  security_group_ingresses = [
-    {
-      security_groups = [module.ecs_service_openwebui_sg.id]
-      port            = 80
-      protocol        = "tcp"
-    }
-  ]
-}
-
-## Bedrock Access Gateway ECS Service
-resource "aws_ecs_task_definition" "task_definition_bag" {
-  family                   = local.ecs.service_name_bedrock_access_gateway
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  memory                   = 1024
-  cpu                      = 512
-  task_role_arn            = module.bag_service_role.arn
-  execution_role_arn       = module.task_execution_role.arn
-
-  runtime_platform {
-    cpu_architecture        = "ARM64"
-    operating_system_family = "LINUX"
-  }
-
-  container_definitions = jsonencode([
-    {
-      name      = "bedrock-access-gateway"
-      image     = "${aws_ecr_repository.bag_repository.repository_url}:latest"
-      essential = true
-      portMappings = [
-        {
-          containerPort = 80
-          hostPort      = 80
-          protocol      = "tcp"
-        }
-      ]
-      secrets = [
-        {
-          name      = "API_KEY"
-          valueFrom = aws_secretsmanager_secret.bag_api_key_secret.arn
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs",
-        options = {
-          awslogs-group         = "/ecs/${local.ecs.cluster_name}"
-          awslogs-region        = var.region
-          awslogs-create-group  = "true"
-          awslogs-stream-prefix = "ecs"
-        }
-      }
-    }
-  ])
-}
-
-resource "aws_ecs_service" "ecs_service_bag" {
-  name            = local.ecs.service_name_bedrock_access_gateway
-  cluster         = aws_ecs_cluster.ecs_cluster.id
-  task_definition = aws_ecs_task_definition.task_definition_bag.arn
-
-  desired_count        = 1
-  launch_type          = "FARGATE"
-  force_new_deployment = true
-
-  network_configuration {
-    subnets          = aws_subnet.module_private_subnets[*].id
-    security_groups  = [module.ecs_service_module_sg.id]
-    assign_public_ip = false
-  }
-
-  service_registries {
-    registry_arn = aws_service_discovery_service.sd_discovery_service_bag.arn
-  }
-}
-
-## MCPO ECS Service
-resource "aws_ecs_task_definition" "task_definition_mcpo" {
-  family                   = local.ecs.service_name_mcpo
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  memory                   = 1024
-  cpu                      = 512
-  execution_role_arn       = module.task_execution_role.arn
-
-  runtime_platform {
-    cpu_architecture        = "ARM64"
-    operating_system_family = "LINUX"
-  }
-
-  container_definitions = jsonencode([
-    {
-      name      = "mcpo"
-      image     = "${aws_ecr_repository.mcpo_repository.repository_url}:latest"
-      essential = true
-      portMappings = [
-        {
-          containerPort = 80
-          hostPort      = 80
-          protocol      = "tcp"
-        }
-      ]
-      secrets = [
-        {
-          name      = "API_KEY"
-          valueFrom = aws_secretsmanager_secret.mcpo_api_key_secret.arn
-        },
-        {
-          name      = "GITLAB_PERSONAL_ACCESS_TOKEN"
-          valueFrom = aws_secretsmanager_secret.gitlab_token_secret.arn
-        },
-        {
-          name      = "LINEAR_API_KEY"
-          valueFrom = aws_secretsmanager_secret.linear_token_secret.arn
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs",
-        options = {
-          awslogs-group         = "/ecs/${local.ecs.cluster_name}"
-          awslogs-region        = var.region
-          awslogs-create-group  = "true"
-          awslogs-stream-prefix = "ecs"
-        }
-      }
-    }
-  ])
-}
-
-resource "aws_ecs_service" "ecs_service_mcpo" {
-  name            = local.ecs.service_name_mcpo
-  cluster         = aws_ecs_cluster.ecs_cluster.id
-  task_definition = aws_ecs_task_definition.task_definition_mcpo.arn
-
-  desired_count        = 1
-  launch_type          = "FARGATE"
-  force_new_deployment = true
-
-  network_configuration {
-    subnets          = aws_subnet.module_private_subnets[*].id
-    security_groups  = [module.ecs_service_module_sg.id]
-    assign_public_ip = true
-  }
-
-  service_registries {
-    registry_arn = aws_service_discovery_service.sd_discovery_service_mcpo.arn
-  }
-}
-
-# Service Discovery for Bedrock Access Gateway
-resource "aws_service_discovery_private_dns_namespace" "sd_dns_namespace" {
-  name = "bedrock.local"
-  vpc  = aws_vpc.default.id
-}
-
-resource "aws_service_discovery_service" "sd_discovery_service_bag" {
-  name = "gateway"
-
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.sd_dns_namespace.id
-
-    dns_records {
-      ttl  = 10
-      type = "A"
-    }
-
-    routing_policy = "MULTIVALUE"
-  }
-
-  health_check_custom_config {
-    failure_threshold = 1
-  }
-}
-
-resource "aws_service_discovery_service" "sd_discovery_service_mcpo" {
-  name = "mcpo"
-
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.sd_dns_namespace.id
-
-    dns_records {
-      ttl  = 10
-      type = "A"
-    }
-
-    routing_policy = "MULTIVALUE"
-  }
-
-  health_check_custom_config {
-    failure_threshold = 1
-  }
+# Generate random secret key for WebUI
+resource "random_password" "webui_secret_key" {
+  length  = 32
+  special = true
 }
