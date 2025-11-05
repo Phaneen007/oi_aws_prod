@@ -111,6 +111,13 @@ data "aws_iam_policy_document" "task_execution_policy" {
   }
 
   statement {
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      aws_secretsmanager_secret.openrouter_api_key.arn
+    ]
+  }
+
+  statement {
     actions = [
       "ssmmessages:CreateControlChannel",
       "ssmmessages:CreateDataChannel",
@@ -200,7 +207,7 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
   container_definitions = jsonencode([
     {
       name      = "openwebui"
-      image     = "795708473603.dkr.ecr.us-east-1.amazonaws.com/openwebui:latest"
+      image     = "ghcr.io/open-webui/open-webui:main"
       essential = true
       portMappings = [
         {
@@ -241,6 +248,12 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
         {
           name  = "WEBUI_AUTH"
           value = "true"
+        }
+      ]
+      secrets = [
+        {
+          name      = "OPENAI_API_KEY"
+          valueFrom = aws_secretsmanager_secret.openrouter_api_key.arn
         }
       ]
       logConfiguration = {

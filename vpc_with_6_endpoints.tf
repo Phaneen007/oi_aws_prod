@@ -18,9 +18,9 @@ resource "aws_default_security_group" "default_sg" {
   vpc_id = aws_vpc.default.id
 }
 
-# Subnets - Limit to 2 AZs
+# Subnets - Limit to 3 AZs
 resource "aws_subnet" "public_subnets" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   vpc_id                  = aws_vpc.default.id
   cidr_block              = cidrsubnet(local.vpc_cidr, 4, count.index)
@@ -33,7 +33,7 @@ resource "aws_subnet" "public_subnets" {
 }
 
 resource "aws_subnet" "webui_private_subnets" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   vpc_id            = aws_vpc.default.id
   cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + 3)
@@ -45,7 +45,7 @@ resource "aws_subnet" "webui_private_subnets" {
 }
 
 resource "aws_subnet" "module_private_subnets" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   vpc_id            = aws_vpc.default.id
   cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + 6)
@@ -75,7 +75,7 @@ resource "aws_route" "igw_route" {
 }
 
 resource "aws_route_table_association" "public_rt_association" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.public_route_table.id
   subnet_id      = aws_subnet.public_subnets[count.index].id
@@ -91,7 +91,7 @@ resource "aws_nat_gateway" "natgw" {
 }
 
 resource "aws_route_table" "private_route_table" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   vpc_id = aws_vpc.default.id
   tags = {
@@ -100,7 +100,7 @@ resource "aws_route_table" "private_route_table" {
 }
 
 resource "aws_route" "private_nat_route" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   route_table_id         = aws_route_table.private_route_table[count.index].id
   destination_cidr_block = "0.0.0.0/0"
@@ -108,20 +108,32 @@ resource "aws_route" "private_nat_route" {
 }
 
 resource "aws_route_table_association" "private_rt_association_webui" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.private_route_table[count.index].id
   subnet_id      = aws_subnet.webui_private_subnets[count.index].id
 }
 
 resource "aws_route_table_association" "private_rt_association_module" {
-  count = min(2, length(local.availability_zones))
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.private_route_table[count.index].id
   subnet_id      = aws_subnet.module_private_subnets[count.index].id
 }
 
 # VPC Endpoints
+data "aws_iam_policy_document" "secretsmanager_endpoint_policy" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${var.account_id}:root"]
+    }
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:aws:secretsmanager:*:${var.account_id}:secret:*"]
+  }
+}
+
 data "aws_iam_policy_document" "logs_endpoint_policy" {
   statement {
     effect = "Allow"
@@ -188,6 +200,16 @@ module "vpc_interface_endpoints" {
   }
 
   vpc_interface_endpoints = [
+    {
+      name   = "secretsmanager"
+      policy = data.aws_iam_policy_document.secretsmanager_endpoint_policy.json
+    },
+    {
+      name = "ecr.api"
+    },
+    {
+      name = "ecr.dkr"
+    },
     {
       name   = "logs"
       policy = data.aws_iam_policy_document.logs_endpoint_policy.json
