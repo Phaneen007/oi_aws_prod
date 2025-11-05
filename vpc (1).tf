@@ -188,7 +188,7 @@ module "vpc_interface_endpoints" {
       policy = data.aws_iam_policy_document.kms_endpoint_policy.json
     },
     {
-      name = "execute-api"
+      name = "execute-api"  # Added for API Gateway access
     },
     {
       name = "secretsmanager"

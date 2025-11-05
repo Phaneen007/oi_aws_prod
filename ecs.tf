@@ -3,12 +3,6 @@ locals {
     cluster_name       = "openwebui-prod-cluster"
     service_name_webui = "openwebui"
   }
-  
-  # ECR image URIs
-  openwebui_image_uri = "755293985911.dkr.ecr.us-east-1.amazonaws.com/openwebui:latest"
-  
-  # API Gateway endpoint
-  api_gateway_endpoint = "https://yknelpoc91.execute-api.us-east-1.amazonaws.com/prod"
 }
 
 # ECS Cluster
@@ -23,13 +17,7 @@ resource "aws_ecs_cluster" "ecs_cluster" {
 
 resource "aws_ecs_cluster_capacity_providers" "ecs_cluster_capacity_provider" {
   cluster_name       = aws_ecs_cluster.ecs_cluster.name
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-  
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 100
-    base              = 0
-  }
+  capacity_providers = ["FARGATE"]
 }
 
 # Application Load Balancer
@@ -123,13 +111,10 @@ data "aws_iam_policy_document" "task_execution_policy" {
   }
 
   statement {
-    actions = [
-      "ecr:GetAuthorizationToken",
-      "ecr:BatchCheckLayerAvailability",
-      "ecr:GetDownloadUrlForLayer",
-      "ecr:BatchGetImage"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = [
+      aws_secretsmanager_secret.openrouter_api_key.arn
     ]
-    resources = ["*"]
   }
 
   statement {
@@ -158,7 +143,7 @@ module "task_execution_role" {
   ]
 }
 
-# Task Role for OpenWebUI (S3 access only - Bedrock removed)
+# Task Role for OpenWebUI (S3 access)
 data "aws_iam_policy_document" "openwebui_task_policy" {
   # S3 Permissions for file storage
   statement {
@@ -220,10 +205,9 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
   task_role_arn            = module.openwebui_task_role.arn
 
   container_definitions = jsonencode([
-    # Open WebUI Container (Main) - No more sidecar!
     {
       name      = "openwebui"
-      image     = local.openwebui_image_uri
+      image     = "ghcr.io/open-webui/open-webui:main"
       essential = true
       portMappings = [
         {
@@ -250,35 +234,30 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
           name  = "S3_ENDPOINT_URL"
           value = "https://s3.${var.region}.amazonaws.com"
         },
-        # API Gateway Configuration (OpenAI-compatible endpoint)
+        # OpenRouter API Configuration
         {
           name  = "OPENAI_API_BASE_URL"
-          value = "${local.api_gateway_endpoint}/v1"
-        },
-        {
-          name  = "OPENAI_API_KEY"
-          value = "dummy-key-not-required"
+          value = "https://openrouter.ai/api/v1"
         },
         # General Configuration
         {
           name  = "WEBUI_SECRET_KEY"
           value = random_password.webui_secret_key.result
         },
+        # Enable basic authentication
         {
           name  = "WEBUI_AUTH"
           value = "true"
-        },
+        }
+      ]
+      secrets = [
         {
-          name  = "AWS_REGION"
-          value = var.region
-        },
-        {
-          name  = "AWS_DEFAULT_REGION"
-          value = var.region
+          name      = "OPENAI_API_KEY"
+          valueFrom = aws_secretsmanager_secret.openrouter_api_key.arn
         }
       ]
       logConfiguration = {
-        logDriver = "awslogs"
+        logDriver = "awslogs",
         options = {
           awslogs-group         = "/ecs/${local.ecs.cluster_name}/openwebui"
           awslogs-region        = var.region
@@ -297,7 +276,7 @@ resource "aws_ecs_task_definition" "task_definition_openwebui" {
   ])
 
   runtime_platform {
-    cpu_architecture        = "X86_64"
+    cpu_architecture        = "ARM64"
     operating_system_family = "LINUX"
   }
 
@@ -317,14 +296,9 @@ resource "aws_ecs_service" "ecs_service_openwebui" {
   cluster                = aws_ecs_cluster.ecs_cluster.id
   task_definition        = aws_ecs_task_definition.task_definition_openwebui.arn
   desired_count          = 1
+  launch_type            = "FARGATE"
   force_new_deployment   = true
   enable_execute_command = true
-
-  capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 100
-    base              = 0
-  }
 
   network_configuration {
     subnets          = aws_subnet.webui_private_subnets[*].id

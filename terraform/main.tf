@@ -1,6 +1,8 @@
-# Main Terraform configuration - Simplified for cost-efficiency
+# Main Terraform configuration - Optimized for cost-efficiency
 # Uses EFS for database (SQLite) and S3 for file storage
-# Basic authentication (no Cognito for now)
+# API Gateway with Lambda for LLM access via OpenRouter
+# Fargate Spot for reduced compute costs
+# No NAT Gateway - uses VPC endpoints only
 
 # S3 Bucket for Open WebUI file storage
 resource "aws_s3_bucket" "openwebui_storage" {
