@@ -19,8 +19,9 @@ resource "aws_default_security_group" "default_sg" {
 }
 
 # Subnets
+# Limit to 3 AZs to avoid CIDR exhaustion (use first 3 AZs)
 resource "aws_subnet" "public_subnets" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   vpc_id                  = aws_vpc.default.id
   cidr_block              = cidrsubnet(local.vpc_cidr, 4, count.index)
@@ -33,10 +34,10 @@ resource "aws_subnet" "public_subnets" {
 }
 
 resource "aws_subnet" "webui_private_subnets" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   vpc_id            = aws_vpc.default.id
-  cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + length(local.availability_zones)) # Calculate subnet CIDR (add an offset because of public subnets)
+  cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + 3)
   availability_zone = local.availability_zones[count.index]
   tags = {
     Name = "webui-private-subnet-${local.availability_zones[count.index]}",
@@ -45,10 +46,10 @@ resource "aws_subnet" "webui_private_subnets" {
 }
 
 resource "aws_subnet" "module_private_subnets" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   vpc_id            = aws_vpc.default.id
-  cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + 2 * length(local.availability_zones)) # Calculate subnet CIDR (add an offset because of public subnets)
+  cidr_block        = cidrsubnet(local.vpc_cidr, 4, count.index + 6)
   availability_zone = local.availability_zones[count.index]
   tags = {
     Name = "module-private-subnet-${local.availability_zones[count.index]}",
@@ -75,7 +76,7 @@ resource "aws_route" "igw_route" {
 }
 
 resource "aws_route_table_association" "public_rt_association" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.public_route_table.id
   subnet_id      = aws_subnet.public_subnets[count.index].id
@@ -91,16 +92,16 @@ resource "aws_nat_gateway" "natgw" {
 }
 
 resource "aws_route_table" "private_route_table" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   vpc_id = aws_vpc.default.id
   tags = {
-    Name = "rt-private"
+    Name = "rt-private-${count.index}"
   }
 }
 
 resource "aws_route" "private_nat_route" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   route_table_id         = aws_route_table.private_route_table[count.index].id
   destination_cidr_block = "0.0.0.0/0"
@@ -108,14 +109,14 @@ resource "aws_route" "private_nat_route" {
 }
 
 resource "aws_route_table_association" "private_rt_association_webui" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.private_route_table[count.index].id
   subnet_id      = aws_subnet.webui_private_subnets[count.index].id
 }
 
 resource "aws_route_table_association" "private_rt_association_module" {
-  count = length(local.availability_zones)
+  count = min(3, length(local.availability_zones))
 
   route_table_id = aws_route_table.private_route_table[count.index].id
   subnet_id      = aws_subnet.module_private_subnets[count.index].id
@@ -127,7 +128,7 @@ data "aws_iam_policy_document" "secretsmanager_endpoint_policy" {
     effect = "Allow"
     principals {
       type        = "AWS"
-      identifiers = [var.account_id]
+      identifiers = ["arn:aws:iam::${var.account_id}:root"]
     }
     actions   = ["secretsmanager:GetSecretValue"]
     resources = ["arn:aws:secretsmanager:*:${var.account_id}:secret:*"]
@@ -139,7 +140,7 @@ data "aws_iam_policy_document" "logs_endpoint_policy" {
     effect = "Allow"
     principals {
       type        = "AWS"
-      identifiers = [var.account_id]
+      identifiers = ["arn:aws:iam::${var.account_id}:root"]
     }
     actions = [
       "logs:CreateLogGroup",
@@ -159,7 +160,7 @@ data "aws_iam_policy_document" "kms_endpoint_policy" {
     effect = "Allow"
     principals {
       type        = "AWS"
-      identifiers = [var.account_id]
+      identifiers = ["arn:aws:iam::${var.account_id}:root"]
     }
     actions = [
       "kms:Decrypt",
@@ -170,6 +171,21 @@ data "aws_iam_policy_document" "kms_endpoint_policy" {
     resources = [
       "arn:aws:kms:*:${var.account_id}:key/*"
     ]
+  }
+}
+
+# S3 Gateway Endpoint (for S3 access without NAT Gateway charges)
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id       = aws_vpc.default.id
+  service_name = "com.amazonaws.${var.region}.s3"
+  
+  route_table_ids = concat(
+    [aws_route_table.public_route_table.id],
+    aws_route_table.private_route_table[*].id
+  )
+
+  tags = {
+    Name = "s3-gateway-endpoint"
   }
 }
 
@@ -185,18 +201,7 @@ module "vpc_interface_endpoints" {
   }
 
   vpc_interface_endpoints = [
-    {
-      name = "bedrock"
-    },
-    {
-      name = "bedrock-runtime"
-    },
-    {
-      name = "elasticfilesystem"
-    },
-    {
-      name = "elasticfilesystem-fips"
-    },
+    # Removed bedrock and bedrock-runtime endpoints
     {
       name   = "secretsmanager"
       policy = data.aws_iam_policy_document.secretsmanager_endpoint_policy.json
@@ -214,6 +219,9 @@ module "vpc_interface_endpoints" {
     {
       name   = "kms"
       policy = data.aws_iam_policy_document.kms_endpoint_policy.json
+    },
+    {
+      name = "rds"
     }
   ]
 }
